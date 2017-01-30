@@ -1,0 +1,12 @@
+[Unit]
+Description=Epipynet autoconfiguration
+Wants=network.target
+Before=network.target
+
+[Service]
+ExecStart=/usr/sbin/epipynet-autoconfigure
+Restart=on-failure
+StandardError=syslog
+
+[Install]
+WantedBy=multi-user.target

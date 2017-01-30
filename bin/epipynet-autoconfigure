@@ -1,0 +1,192 @@
+#!/usr/bin/env python3
+
+import asyncio
+import json
+import os
+import re
+import socket
+import struct
+import sys
+import syslog
+
+from typing import *
+
+import epipynet.detect
+
+
+SEARCH_NETWORKS_PATH = '/usr/share/epipynet/search-networks'
+SEARCH_NETWORKS_TEST_PATH = 'share/search-networks'
+CONFIG_PATH = '/var/lib/epipynet/config.json'
+TEST_CONFIG_PATH = '/tmp/epipynet/config.json'
+
+ETH_LINK_NAME = 'eth0'
+
+TestMode = 'EPIPYNET_TEST' in os.environ
+
+
+def configure_network(
+        network: epipynet.detect.NetworkTuple) -> None:
+
+    'We found a local network.  Update our configuration.'
+
+    syslog.syslog('configuring network')
+    syslog.syslog('network address is ' + network[0])
+    syslog.syslog('network mask is ' + network[1])
+    syslog.syslog('network gateway is ' + network[2])
+
+    config = {
+        'host_address': network[0],
+        'netmask': network[1],
+        'gateway': network[2],
+    }
+
+    config_json = json.dumps(config, sort_keys=True, indent=4)
+
+    if TestMode:
+        config_path = TEST_CONFIG_PATH
+    else:
+        config_path = CONFIG_PATH
+
+    try:
+        os.mkdir(os.path.dirname(config_path))
+    except FileExistsError:
+        pass
+
+    tmp_filename = config_path + '.tmp.' + str(os.getpid())
+
+    tmp = open(tmp_filename, 'w')
+    try:
+        tmp.write(config_json + '\n')
+    finally:
+        tmp.close()
+
+    os.rename(tmp_filename, config_path)
+
+    if not TestMode:
+        if os.system('epipynet-apply-config'):
+            syslog.syslog('epipynet-apply-config failed')
+
+
+def network_device_up(
+        device: str) -> None:
+
+    'Set the ethernet device to up so we can ARP'
+
+    if TestMode:
+        return
+
+    if os.system('ip link set ' + device + ' up'):
+        syslog.syslog('Failed to set network up')
+        sys.exit(1)
+
+
+def network_device_down(
+        device: str) -> None:
+
+    'Set the ethernet device to down if we are exiting'
+
+    if TestMode:
+        return
+
+    if os.system('ip link set ' + device + ' down'):
+        syslog.syslog('Failed to set network down\n')
+
+
+def slash_to_netmask(
+        slash_value: int) -> str:
+
+    'Convert subnet slash notation (i.e. "/24") to a subnet mask'
+
+    netmask_int = (1 << 32) - (1 << (32 - slash_value))
+    netmask_bits = struct.pack('!I', netmask_int)
+    return socket.inet_ntoa(netmask_bits)
+
+
+def read_search_networks() -> List[epipynet.detect.NetworkTuple]:
+
+    'Read the list of networks to search for from file'
+
+    subnet_re = r'([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)/([0-9]+)'
+
+    networks = []  # type: List[epipynet.detect.NetworkTuple]
+    line_number = 0
+
+    if TestMode:
+        search_file_path = SEARCH_NETWORKS_TEST_PATH
+    else:
+        search_file_path = SEARCH_NETWORKS_PATH
+
+    with open(search_file_path) as networks_file:
+        for line in networks_file:
+            line_number += 1
+            line = line.split('#')[0].strip()
+
+            if len(line) == 0:
+                continue
+
+            match = re.match(subnet_re, line)
+            if not match:
+                syslog.syslog(
+                    'error in search-networks on line ' +
+                    str(line_number) + '\n')
+                continue
+
+            address = match.group(1)
+            slash_value = int(match.group(2))
+
+            networks.append((
+                None,
+                slash_to_netmask(slash_value),
+                address))
+
+    return networks
+
+
+def start_network_detect(
+        interface_name: str,
+        event_loop: asyncio.AbstractEventLoop,
+        networks: Iterable[epipynet.detect.NetworkTuple]) -> None:
+
+    'Start the network detection process, adding a callback for completion'
+
+    try:
+        network_future = epipynet.detect.detect_network(
+            ETH_LINK_NAME, event_loop, networks)
+    except PermissionError:
+        syslog.syslog('Permission denied for socket')
+        sys.exit(1)
+
+    network_future.add_done_callback(
+        lambda future: configure_network(future.result()))
+
+
+def main() -> None:
+
+    '''Scan for a local network, and configure the OS network interface
+    when it is found.'''
+
+    if TestMode:
+        syslog.syslog('starting in test mode')
+    else:
+        syslog.syslog('starting')
+
+    try:
+        potential_networks = read_search_networks()
+    except FileNotFoundError:
+        syslog.syslog('search-networks missing')
+        potential_networks = []
+
+    loop = asyncio.get_event_loop()
+    try:
+        network_device_up(ETH_LINK_NAME)
+        try:
+            start_network_detect(ETH_LINK_NAME, loop, potential_networks)
+            loop.run_forever()
+        finally:
+            network_device_down(ETH_LINK_NAME)
+    finally:
+        loop.close()
+
+
+if __name__ == '__main__':
+    main()
