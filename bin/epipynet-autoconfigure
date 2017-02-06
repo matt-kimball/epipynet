@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import asyncio
+import contextlib
 import json
 import os
 import re
@@ -18,10 +19,21 @@ SEARCH_NETWORKS_PATH = '/usr/share/epipynet/search-networks'
 SEARCH_NETWORKS_TEST_PATH = 'share/search-networks'
 CONFIG_PATH = '/var/lib/epipynet/config.json'
 TEST_CONFIG_PATH = '/tmp/epipynet/config.json'
+EPIPYNET_SOCKET_PATH = '/var/run/epipynet/epipynet.sock'
 
 ETH_LINK_NAME = 'eth0'
+DHCP_SCAN_TIME = 5 * 60  # Scan every five minutes
 
 TestMode = 'EPIPYNET_TEST' in os.environ
+
+
+#  This nonsense is because Python 3.4.2 lacks ensure_future,
+#  but has async, however, mypy 0.470 understands ensure_future,
+#  but not async.
+try:
+    ensure_future = asyncio.ensure_future
+except AttributeError:
+    ensure_future = getattr(asyncio, 'async')
 
 
 def configure_network(
@@ -47,18 +59,13 @@ def configure_network(
     else:
         config_path = CONFIG_PATH
 
-    try:
+    with contextlib.suppress(FileExistsError):
         os.mkdir(os.path.dirname(config_path))
-    except FileExistsError:
-        pass
 
     tmp_filename = config_path + '.tmp.' + str(os.getpid())
 
-    tmp = open(tmp_filename, 'w')
-    try:
+    with open(tmp_filename, 'w') as tmp:
         tmp.write(config_json + '\n')
-    finally:
-        tmp.close()
 
     os.rename(tmp_filename, config_path)
 
@@ -142,22 +149,183 @@ def read_search_networks() -> List[epipynet.detect.NetworkTuple]:
     return networks
 
 
-def start_network_detect(
-        interface_name: str,
-        event_loop: asyncio.AbstractEventLoop,
-        networks: Iterable[epipynet.detect.NetworkTuple]) -> None:
+class NetworkStatus(object):
 
-    'Start the network detection process, adding a callback for completion'
+    'A tracker for the current status of the network'
 
-    try:
-        network_future = epipynet.detect.detect_network(
-            ETH_LINK_NAME, event_loop, networks)
-    except PermissionError:
-        syslog.syslog('Permission denied for socket')
-        sys.exit(1)
+    def __init__(
+            self,
+            interface_name: str,
+            event_loop: asyncio.AbstractEventLoop) -> None:
 
-    network_future.add_done_callback(
-        lambda future: configure_network(future.result()))
+        self.interface_name = interface_name  # type: str
+        self.event_loop = event_loop  # type: asyncio.AbstractEventLoop
+        self.network = None  # type: epipynet.detect.NetworkTuple
+
+        self.dhcp_scan = None  # type: asyncio.Future
+        self.dhcp_scan_complete = False  # type: bool
+        self.dhcp_server = None  # type: str
+
+    def start_network_detect(
+            self,
+            networks: Iterable[epipynet.detect.NetworkTuple]) -> None:
+
+        '''Start the network detection process, storing the results
+        in self.network upon completion'''
+
+        try:
+            network_future = epipynet.detect.detect_network(
+                self.interface_name, self.event_loop, networks)
+        except PermissionError:
+            syslog.syslog('Permission denied for socket')
+            sys.exit(1)
+
+        def on_network_detect(
+                future: asyncio.Future) -> None:
+
+            self.network = future.result()
+            configure_network(self.network)
+
+            self.dhcp_scan = ensure_future(scan_for_dhcp_server(self))
+
+        network_future.add_done_callback(on_network_detect)
+
+
+@asyncio.coroutine
+def detect_dhcp_server(
+        network_status: NetworkStatus) -> Generator[Any, None, None]:
+
+    network_status.dhcp_server = \
+        yield from epipynet.detect.detect_dhcp_server(
+            network_status.interface_name,
+            network_status.network[0],
+            network_status.event_loop)
+    network_status.dhcp_scan_complete = True
+
+
+@asyncio.coroutine
+def scan_for_dhcp_server(
+        network_status: NetworkStatus) -> Generator[Any, None, None]:
+
+    '''Periodically scan for a DHCP server on the network.
+
+    We do this as a separate coroutine so that the status report
+    can complete immediately if there is no DHCP server found
+    during the last scan.  Otherwise, refreshing the status would
+    be a lengthy process of waiting for the DHCP scan to timeout
+    when no server is present.'''
+
+    while True:
+        yield from detect_dhcp_server(network_status)
+        yield from asyncio.sleep(DHCP_SCAN_TIME)
+
+
+@asyncio.coroutine
+def get_status_report(
+        network_status: NetworkStatus) -> Generator[Any, None, Dict]:
+
+    'Generate a report in response to a status request'
+
+    network = network_status.network
+
+    if network_status.dhcp_scan_complete and not network_status.dhcp_server:
+        #  If our most recent DHCP scan indicated no DHCP server, we won't
+        #  rescan, as it is unlikely one has just been added, and this will
+        #  make the status web page more responsive
+        dhcp_server = None
+    else:
+        #  If we recently found a DHCP server, rescan for the status request
+        #  since the scan should complete quickly if the DHCP server
+        #  still exists, and the user will want to refresh the status page
+        #  to see that the DHCP server has been disabled
+        yield from detect_dhcp_server(network_status)
+        dhcp_server = network_status.dhcp_server
+
+    if network:
+        status = {
+            'router_address': network[2],
+            'subnet_mask': network[1],
+            'dns_addresses': '8.8.4.4',
+            'device_address': network[0],
+            'dhcp_server': dhcp_server
+        }
+    else:
+        status = {'err': 'no-network'}
+
+    return status
+
+
+class EpipynetProtocol(asyncio.Protocol):
+
+    'Protocol for responding to requests from the Unix domain socket'
+
+    def __init__(
+            self,
+            network_status: NetworkStatus) -> None:
+
+        self.network_status = network_status  # type: NetworkStatus
+        self.transport = None  # type: asyncio.Transport
+
+    def connection_made(
+            self,
+            transport: asyncio.BaseTransport) -> None:
+
+        'When a new connection is made, await a request command'
+
+        self.transport = cast(asyncio.Transport, transport)
+
+    def data_received(
+            self,
+            data: bytes) -> None:
+
+        'Handle a request command by starting an appropriate coroutine'
+
+        def write_result(
+                result: Dict) -> None:
+
+            result_bytes = json.dumps(result).encode('utf-8')
+            self.transport.write(result_bytes + b'\n')
+            self.transport.close()
+
+        result = {'err': 'invalid-command'}
+        if b'\n' in data:
+            command = data.split(b'\n')[0].decode('utf-8')
+
+            if command == 'status':
+                status_future = None  # type: asyncio.Future
+
+                status_future = ensure_future(
+                    get_status_report(self.network_status))
+
+                status_future.add_done_callback(
+                    lambda future: write_result(future.result()))
+
+                return
+
+        write_result(result)
+
+
+def start_epipynet_server(
+        loop: asyncio.AbstractEventLoop,
+        network_status: NetworkStatus) -> asyncio.AbstractServer:
+
+    'Start a server object for handling requests via the Unix domain socket'
+
+    with contextlib.suppress(FileExistsError):
+        os.mkdir(os.path.dirname(EPIPYNET_SOCKET_PATH))
+
+    with contextlib.suppress(FileNotFoundError):
+        os.unlink(EPIPYNET_SOCKET_PATH)
+
+    def create_protocol() -> EpipynetProtocol:
+        return EpipynetProtocol(network_status)
+
+    old_umask = os.umask(0)
+    coro = loop.create_unix_server(create_protocol, EPIPYNET_SOCKET_PATH)
+    server = loop.run_until_complete(coro)
+    os.umask(old_umask)
+
+    return server
 
 
 def main() -> None:
@@ -176,16 +344,18 @@ def main() -> None:
         syslog.syslog('search-networks missing')
         potential_networks = []
 
-    loop = asyncio.get_event_loop()
-    try:
-        network_device_up(ETH_LINK_NAME)
-        try:
-            start_network_detect(ETH_LINK_NAME, loop, potential_networks)
-            loop.run_forever()
-        finally:
-            network_device_down(ETH_LINK_NAME)
-    finally:
-        loop.close()
+    with contextlib.closing(asyncio.get_event_loop()) as loop:
+        network_status = NetworkStatus(ETH_LINK_NAME, loop)
+
+        server = start_epipynet_server(loop, network_status)
+        with contextlib.closing(server):
+            network_device_up(ETH_LINK_NAME)
+            try:
+                network_status.start_network_detect(potential_networks)
+
+                loop.run_forever()
+            finally:
+                network_device_down(ETH_LINK_NAME)
 
 
 if __name__ == '__main__':

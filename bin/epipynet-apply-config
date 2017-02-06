@@ -28,10 +28,8 @@ def load_config(
             sys.argv[0] + ': failure to open configuration file\n')
         sys.exit(1)
 
-    try:
+    with config_file:
         config_text = config_file.read()
-    finally:
-        config_file.close()
 
     try:
         config = json.loads(config_text)

@@ -1,4 +1,5 @@
 import asyncio
+import contextlib
 import os
 import struct
 import socket
@@ -73,6 +74,20 @@ def enumerate_subnet_addresses(
         yield socket.inet_ntoa(struct.pack('!I', new_ip))
 
 
+def get_test_socket(
+        port: int) -> socket.socket:
+
+    'Get a UDP socket simulating an ethernet packet socket for testing'
+
+    sock = socket.socket(
+        socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
+
+    addr = ('localhost', port)
+    sock.connect(addr)
+
+    return sock
+
+
 def get_dhcp_socket(
         interface_name: str) -> socket.socket:
 
@@ -80,6 +95,9 @@ def get_dhcp_socket(
 
     We need an explicit interface association since the interface likely
     does not have an IP address already configured.'''
+
+    if TestMode:
+        return get_test_socket(TEST_DHCP_PORT)
 
     sock = socket.socket(socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
     sock.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -99,24 +117,13 @@ def get_ethertype_socket(
 
     'Get an ethernet packet socket bound to a particular ethertype'
 
+    if TestMode:
+        return get_test_socket(TEST_ARP_PORT)
+
     sock = socket.socket(
         socket.AF_PACKET, socket.SOCK_RAW, socket.htons(ethertype))
 
     sock.bind((interface_name, ethertype))
-    return sock
-
-
-def get_test_socket(
-        port: int) -> socket.socket:
-
-    'Get a UDP socket simulating an ethernet packet socket for testing'
-
-    sock = socket.socket(
-        socket.AF_INET, socket.SOCK_DGRAM, socket.IPPROTO_UDP)
-
-    addr = ('localhost', port)
-    sock.connect(addr)
-
     return sock
 
 
@@ -220,7 +227,8 @@ def exchange_dhcp(
         event_loop: asyncio.AbstractEventLoop,
         dhcp_socket: socket.socket,
         out_packet: epipynet.dhcp.DhcpPacket,
-        reply_type: bytes) -> DhcpPacketGenerator:
+        reply_type: bytes,
+        ignore_ip: bytes = None) -> DhcpPacketGenerator:
 
     '''Send a DHCP message and listen for a matching reply.
 
@@ -240,6 +248,9 @@ def exchange_dhcp(
                 return
 
             if reply.xid != out_packet.xid:
+                return
+
+            if reply.server_addr == ignore_ip:
                 return
 
             try:
@@ -457,13 +468,9 @@ def detect_network(
 
     'Start scanning for gateways on the network'
 
-    if TestMode:
-        arp_socket = get_test_socket(TEST_ARP_PORT)
-        dhcp_socket = get_test_socket(TEST_DHCP_PORT)
-    else:
-        arp_socket = get_ethertype_socket(
-            interface_name, epipynet.arp.ETHERTYPE_ARP)
-        dhcp_socket = get_dhcp_socket(interface_name)
+    arp_socket = get_ethertype_socket(
+        interface_name, epipynet.arp.ETHERTYPE_ARP)
+    dhcp_socket = get_dhcp_socket(interface_name)
 
     found_network_future = event_loop.create_task(find_network(
         event_loop, arp_socket, dhcp_socket, networks))
@@ -471,7 +478,70 @@ def detect_network(
     def on_done(
             future: asyncio.Future) -> None:
         arp_socket.close()
+        dhcp_socket.close()
 
     found_network_future.add_done_callback(on_done)
 
     return found_network_future
+
+
+@asyncio.coroutine
+def detect_dhcp_server_with_lock(
+        interface_name: str,
+        local_ip: str,
+        event_loop: asyncio.AbstractEventLoop) -> Generator[Any, None, str]:
+
+    '''Return the IP address of a DHCP device on the network,
+    other than our local DHCP server.  Return None if we are the
+    only DHCP server on the network.'''
+
+    with contextlib.closing(get_ethertype_socket(
+                interface_name, epipynet.arp.ETHERTYPE_ARP)) as arp_socket, \
+            contextlib.closing(get_dhcp_socket(
+                interface_name)) as dhcp_socket:
+
+        mac_address = get_mac_address(arp_socket)
+        discover = build_dhcp_discover(mac_address)
+
+        local_ip_addr = socket.inet_aton(local_ip)
+        offer = yield from exchange_dhcp(
+            event_loop,
+            dhcp_socket,
+            discover,
+            epipynet.dhcp.DHCP_TYPE_OFFER,
+            ignore_ip=local_ip_addr)
+
+        if offer:
+            return socket.inet_ntoa(offer.server_addr)
+        else:
+            return None
+
+
+detect_dhcp_lock = asyncio.Lock()
+detect_dhcp_result = None  # type: str
+
+
+@asyncio.coroutine
+def detect_dhcp_server(
+        interface_name: str,
+        local_ip: str,
+        event_loop: asyncio.AbstractEventLoop) -> Generator[Any, None, str]:
+
+    '''Detect a DHCP server on the network.
+
+    Use the DHCP lock such that multiple parallel calls to
+    detect_dhcp_server will only result in a single detection process.
+    The first instance will do the work, and the other invocations will
+    use the result from the first invocation when it completes'''
+
+    global detect_dhcp_lock
+    global detect_dhcp_result
+
+    if not detect_dhcp_lock.locked():
+        with (yield from detect_dhcp_lock):
+            detect_dhcp_result = yield from detect_dhcp_server_with_lock(
+                interface_name, local_ip, event_loop)
+            return detect_dhcp_result
+    else:
+        with (yield from detect_dhcp_lock):
+            return detect_dhcp_result
