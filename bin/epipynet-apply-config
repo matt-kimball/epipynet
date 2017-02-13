@@ -149,7 +149,7 @@ def restart_services() -> None:
 
     'Restart DNSmasq as we have generated new configuration for it'
 
-    os.system('systemctl try-restart dnsmasq')
+    os.system('systemctl restart dnsmasq')
 
 
 def main() -> None:

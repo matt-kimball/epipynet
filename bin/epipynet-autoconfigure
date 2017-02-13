@@ -99,6 +99,13 @@ def network_device_down(
         syslog.syslog('Failed to set network down\n')
 
 
+def stop_dnsmasq() -> None:
+
+    'Stop the dnsmasq service, so we can do DHCP without it responding'
+
+    os.system('systemctl stop dnsmasq')
+
+
 def slash_to_netmask(
         slash_value: int) -> str:
 
@@ -350,12 +357,10 @@ def main() -> None:
         server = start_epipynet_server(loop, network_status)
         with contextlib.closing(server):
             network_device_up(ETH_LINK_NAME)
-            try:
-                network_status.start_network_detect(potential_networks)
+            stop_dnsmasq()
+            network_status.start_network_detect(potential_networks)
 
-                loop.run_forever()
-            finally:
-                network_device_down(ETH_LINK_NAME)
+            loop.run_forever()
 
 
 if __name__ == '__main__':
