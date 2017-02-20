@@ -12,7 +12,8 @@ LIBS="\
     lib/epipynet/__init__.py \
     lib/epipynet/arp.py \
     lib/epipynet/detect.py \
-    lib/epipynet/dhcp.py"
+    lib/epipynet/dhcp.py \
+    lib/epipynet/netconfig.py"
 
 SYSTEMD="\
     systemd/epipynet.service"

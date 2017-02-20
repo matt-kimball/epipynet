@@ -13,13 +13,16 @@ import syslog
 from typing import *
 
 import epipynet.detect
+import epipynet.netconfig
 
 
 SEARCH_NETWORKS_PATH = '/usr/share/epipynet/search-networks'
-SEARCH_NETWORKS_TEST_PATH = 'share/search-networks'
 CONFIG_PATH = '/var/lib/epipynet/config.json'
-TEST_CONFIG_PATH = '/tmp/epipynet/config.json'
 EPIPYNET_SOCKET_PATH = '/var/run/epipynet/epipynet.sock'
+
+SEARCH_NETWORKS_TEST_PATH = 'share/search-networks'
+TEST_CONFIG_PATH = '/tmp/epipynet/config.json'
+TEST_SOCKET_PATH = '/tmp/epipynet.sock'
 
 ETH_LINK_NAME = 'eth0'
 DHCP_SCAN_TIME = 5 * 60  # Scan every five minutes
@@ -36,23 +39,41 @@ except AttributeError:
     ensure_future = getattr(asyncio, 'async')
 
 
+def load_network_config() -> epipynet.netconfig.NetworkConfig:
+
+    'Load the network configuration used in a previous run'
+
+    if TestMode:
+        config_path = TEST_CONFIG_PATH
+    else:
+        config_path = CONFIG_PATH
+
+    with open(config_path) as config_file:
+        config_json = config_file.read()
+
+    return epipynet.netconfig.from_json(config_json)
+
+
+def apply_existing_config() -> None:
+
+    'Apply the network configuration as it is stored in the config file'
+
+    if not TestMode:
+        if os.system('epipynet-apply-config'):
+            syslog.syslog('epipynet-apply-config failed')
+
+
 def configure_network(
-        network: epipynet.detect.NetworkTuple) -> None:
+        network: epipynet.netconfig.NetworkConfig) -> None:
 
     'We found a local network.  Update our configuration.'
 
     syslog.syslog('configuring network')
-    syslog.syslog('network address is ' + network[0])
-    syslog.syslog('network mask is ' + network[1])
-    syslog.syslog('network gateway is ' + network[2])
+    syslog.syslog('network address is ' + network.address)
+    syslog.syslog('network mask is ' + network.netmask)
+    syslog.syslog('network gateway is ' + network.gateway)
 
-    config = {
-        'host_address': network[0],
-        'netmask': network[1],
-        'gateway': network[2],
-    }
-
-    config_json = json.dumps(config, sort_keys=True, indent=4)
+    config_json = network.to_json()
 
     if TestMode:
         config_path = TEST_CONFIG_PATH
@@ -68,10 +89,7 @@ def configure_network(
         tmp.write(config_json + '\n')
 
     os.rename(tmp_filename, config_path)
-
-    if not TestMode:
-        if os.system('epipynet-apply-config'):
-            syslog.syslog('epipynet-apply-config failed')
+    apply_existing_config()
 
 
 def network_device_up(
@@ -103,6 +121,9 @@ def stop_dnsmasq() -> None:
 
     'Stop the dnsmasq service, so we can do DHCP without it responding'
 
+    if TestMode:
+        return
+
     os.system('systemctl stop dnsmasq')
 
 
@@ -116,13 +137,13 @@ def slash_to_netmask(
     return socket.inet_ntoa(netmask_bits)
 
 
-def read_search_networks() -> List[epipynet.detect.NetworkTuple]:
+def read_search_networks() -> List[epipynet.netconfig.NetworkConfig]:
 
     'Read the list of networks to search for from file'
 
     subnet_re = r'([0-9]+\.[0-9]+\.[0-9]+\.[0-9]+)/([0-9]+)'
 
-    networks = []  # type: List[epipynet.detect.NetworkTuple]
+    networks = []  # type: List[epipynet.netconfig.NetworkConfig]
     line_number = 0
 
     if TestMode:
@@ -148,10 +169,12 @@ def read_search_networks() -> List[epipynet.detect.NetworkTuple]:
             address = match.group(1)
             slash_value = int(match.group(2))
 
-            networks.append((
-                None,
-                slash_to_netmask(slash_value),
-                address))
+            config = epipynet.netconfig.NetworkConfig()
+            config.netmask = slash_to_netmask(slash_value)
+            config.gateway = address
+            config.dns_servers = [address]
+
+            networks.append(config)
 
     return networks
 
@@ -163,11 +186,12 @@ class NetworkStatus(object):
     def __init__(
             self,
             interface_name: str,
+            network: epipynet.netconfig.NetworkConfig,
             event_loop: asyncio.AbstractEventLoop) -> None:
 
         self.interface_name = interface_name  # type: str
         self.event_loop = event_loop  # type: asyncio.AbstractEventLoop
-        self.network = None  # type: epipynet.detect.NetworkTuple
+        self.network = network  # type: epipynet.netconfig.NetworkConfig
 
         self.dhcp_scan = None  # type: asyncio.Future
         self.dhcp_scan_complete = False  # type: bool
@@ -175,14 +199,27 @@ class NetworkStatus(object):
 
     def start_network_detect(
             self,
-            networks: Iterable[epipynet.detect.NetworkTuple]) -> None:
+            networks: List[epipynet.netconfig.NetworkConfig]) -> None:
 
         '''Start the network detection process, storing the results
         in self.network upon completion'''
 
+        scan_networks = []
+
+        if self.network:
+            local_ip = self.network.address
+            scan_networks.append(self.network)
+        else:
+            local_ip = None
+
+        scan_networks = scan_networks + networks
+
         try:
             network_future = epipynet.detect.detect_network(
-                self.interface_name, self.event_loop, networks)
+                self.interface_name,
+                local_ip,
+                self.event_loop,
+                scan_networks)
         except PermissionError:
             syslog.syslog('Permission denied for socket')
             sys.exit(1)
@@ -205,7 +242,7 @@ def detect_dhcp_server(
     network_status.dhcp_server = \
         yield from epipynet.detect.detect_dhcp_server(
             network_status.interface_name,
-            network_status.network[0],
+            network_status.network.address,
             network_status.event_loop)
     network_status.dhcp_scan_complete = True
 
@@ -250,10 +287,10 @@ def get_status_report(
 
     if network:
         status = {
-            'router_address': network[2],
-            'subnet_mask': network[1],
-            'dns_addresses': '8.8.4.4',
-            'device_address': network[0],
+            'router_address': network.gateway,
+            'subnet_mask': network.netmask,
+            'dns_addresses': ','.join(network.dns_servers),
+            'device_address': network.address,
             'dhcp_server': dhcp_server
         }
     else:
@@ -318,17 +355,22 @@ def start_epipynet_server(
 
     'Start a server object for handling requests via the Unix domain socket'
 
+    if TestMode:
+        socket_path = TEST_SOCKET_PATH
+    else:
+        socket_path = EPIPYNET_SOCKET_PATH
+
     with contextlib.suppress(FileExistsError):
-        os.mkdir(os.path.dirname(EPIPYNET_SOCKET_PATH))
+        os.mkdir(os.path.dirname(socket_path))
 
     with contextlib.suppress(FileNotFoundError):
-        os.unlink(EPIPYNET_SOCKET_PATH)
+        os.unlink(socket_path)
 
     def create_protocol() -> EpipynetProtocol:
         return EpipynetProtocol(network_status)
 
     old_umask = os.umask(0)
-    coro = loop.create_unix_server(create_protocol, EPIPYNET_SOCKET_PATH)
+    coro = loop.create_unix_server(create_protocol, socket_path)
     server = loop.run_until_complete(coro)
     os.umask(old_umask)
 
@@ -352,12 +394,19 @@ def main() -> None:
         potential_networks = []
 
     with contextlib.closing(asyncio.get_event_loop()) as loop:
-        network_status = NetworkStatus(ETH_LINK_NAME, loop)
+        network_device_up(ETH_LINK_NAME)
 
+        try:
+            config = load_network_config()
+
+            syslog.syslog('applying previous network configuration')
+            apply_existing_config()
+        except FileNotFoundError:
+            config = None
+
+        network_status = NetworkStatus(ETH_LINK_NAME, config, loop)
         server = start_epipynet_server(loop, network_status)
         with contextlib.closing(server):
-            network_device_up(ETH_LINK_NAME)
-            stop_dnsmasq()
             network_status.start_network_detect(potential_networks)
 
             loop.run_forever()

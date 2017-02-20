@@ -9,6 +9,7 @@ from typing import *
 
 import epipynet.arp
 import epipynet.dhcp
+import epipynet.netconfig
 
 
 ARP_PACKET_TIME = 0.01
@@ -36,9 +37,10 @@ else:
 
 
 #  (ip_address, netmask, gateway)
-NetworkTuple = Tuple[str, str, str]
-NetworkTupleGenerator = Generator[Any, None, NetworkTuple]
-DhcpPacketGenerator = Generator[Any, None, epipynet.dhcp.DhcpPacket]
+NetworkConfigGenerator = \
+    Generator[Any, None, epipynet.netconfig.NetworkConfig]
+DhcpPacketGenerator = \
+    Generator[Any, None, epipynet.dhcp.DhcpPacket]
 
 
 #  This nonsense is because Python 3.4.2 lacks ensure_future,
@@ -59,15 +61,14 @@ class NoAvailableIPAddressException(Exception):
 
 
 def enumerate_subnet_addresses(
-        network: NetworkTuple) -> Generator[str, None, None]:
+        network: epipynet.netconfig.NetworkConfig) \
+        -> Generator[str, None, None]:
 
     '''Given a gateway and netmask, generate all valid IP addresses
     on the subnet.'''
 
-    (ip_address, netmask, gateway) = network
-
-    netmask_int = struct.unpack('!I', socket.inet_aton(netmask))[0]
-    gateway_int = struct.unpack('!I', socket.inet_aton(gateway))[0]
+    netmask_int = struct.unpack('!I', socket.inet_aton(network.netmask))[0]
+    gateway_int = struct.unpack('!I', socket.inet_aton(network.gateway))[0]
 
     for i in range(1, (1 << 32) - netmask_int):
         new_ip = (gateway_int & netmask_int) + i
@@ -228,7 +229,7 @@ def exchange_dhcp(
         dhcp_socket: socket.socket,
         out_packet: epipynet.dhcp.DhcpPacket,
         reply_type: bytes,
-        ignore_ip: bytes = None) -> DhcpPacketGenerator:
+        ignore_ip: bytes) -> DhcpPacketGenerator:
 
     '''Send a DHCP message and listen for a matching reply.
 
@@ -324,17 +325,43 @@ def build_dhcp_request(
     return request
 
 
+def address_list_inet_ntoa(
+        addresses: bytes) -> List[str]:
+
+    'Convert multiple binary IPv4 addresses to a list of address strings'
+
+    address_list = []
+
+    while len(addresses) >= 4:
+        address = addresses[0:4]
+        addresses = addresses[4:]
+
+        address_list.append(socket.inet_ntoa(address))
+
+    return address_list
+
+
 @asyncio.coroutine
 def request_dhcp(
         event_loop: asyncio.AbstractEventLoop,
+        local_ip: str,
         dhcp_socket: socket.socket,
-        mac_address: bytes) -> NetworkTupleGenerator:
+        mac_address: bytes) -> NetworkConfigGenerator:
 
     'Request network configuration via DHCP'
 
+    if local_ip:
+        local_ip_addr = socket.inet_aton(local_ip)
+    else:
+        local_ip_addr = None
+
     discover = build_dhcp_discover(mac_address)
     offer = yield from exchange_dhcp(
-        event_loop, dhcp_socket, discover, epipynet.dhcp.DHCP_TYPE_OFFER)
+        event_loop,
+        dhcp_socket,
+        discover,
+        epipynet.dhcp.DHCP_TYPE_OFFER,
+        local_ip_addr)
     if not offer:
         return None
 
@@ -342,7 +369,11 @@ def request_dhcp(
 
     request = build_dhcp_request(offer, mac_address)
     ack = yield from exchange_dhcp(
-        event_loop, dhcp_socket, request, epipynet.dhcp.DHCP_TYPE_ACK)
+        event_loop,
+        dhcp_socket,
+        request,
+        epipynet.dhcp.DHCP_TYPE_ACK,
+        local_ip_addr)
     if not ack:
         syslog.syslog('No DHCP ack received')
         return None
@@ -353,17 +384,29 @@ def request_dhcp(
             offer.get_option(epipynet.dhcp.DHCP_OPTION_SUBNET))
         gateway = socket.inet_ntoa(
             offer.get_option(epipynet.dhcp.DHCP_OPTION_ROUTER))
-
-        return (ip_address, netmask, gateway)
     except KeyError:
         return None
+
+    try:
+        dns_server_bytes = offer.get_option(epipynet.dhcp.DHCP_OPTION_DNS)
+    except KeyError:
+        dns_server_bytes = b''
+
+    config = epipynet.netconfig.NetworkConfig()
+    config.address = ip_address
+    config.netmask = netmask
+    config.gateway = gateway
+    config.dns_servers = address_list_inet_ntoa(dns_server_bytes)
+
+    return config
 
 
 @asyncio.coroutine
 def find_gateway(
         arp_socket: socket.socket,
         arp_reply_listener: ArpReplyListener,
-        networks: Iterable[NetworkTuple]) -> NetworkTupleGenerator:
+        networks: Iterable[epipynet.netconfig.NetworkConfig]) \
+        -> NetworkConfigGenerator:
 
     '''Send ARP packets to potential gateway addresses until we
     get a response.  on_arp_reply will complete
@@ -376,7 +419,7 @@ def find_gateway(
             if gateway_future.done():
                 return gateway_future.result()
 
-            gateway_address = socket.inet_aton(network[2])
+            gateway_address = socket.inet_aton(network.gateway)
             send_arp_request(arp_socket, gateway_address)
             arp_reply_listener.listen_for_ip(
                 gateway_address, gateway_future, network)
@@ -392,7 +435,8 @@ def find_gateway(
 def find_unused_ip(
         arp_socket: socket.socket,
         arp_reply_listener: ArpReplyListener,
-        network: NetworkTuple) -> Generator[Any, None, str]:
+        network: epipynet.netconfig.NetworkConfig) \
+        -> Generator[Any, None, str]:
 
     '''Search for an unused IP address on the attacked network
     by generating ARPs, succeeding when several consecutive ARPs
@@ -429,9 +473,11 @@ def find_unused_ip(
 @asyncio.coroutine
 def find_network(
         event_loop: asyncio.AbstractEventLoop,
+        local_ip: str,
         arp_socket: socket.socket,
         dhcp_socket: socket.socket,
-        networks: Iterable[NetworkTuple]) -> NetworkTupleGenerator:
+        networks: Iterable[epipynet.netconfig.NetworkConfig]) \
+        -> NetworkConfigGenerator:
 
     'Locate a gateway and an unused IP address on the attached network'
 
@@ -441,7 +487,7 @@ def find_network(
     arp_reply_listener.start()
     try:
         network = yield from request_dhcp(
-            event_loop, dhcp_socket, mac_address)
+            event_loop, local_ip, dhcp_socket, mac_address)
 
         if network:
             syslog.syslog('acquired DHCP configuration')
@@ -451,20 +497,24 @@ def find_network(
 
         network = yield from find_gateway(
             arp_socket, arp_reply_listener, networks)
-        syslog.syslog('found gateway at ' + network[2])
+        syslog.syslog('found gateway at ' + network.gateway)
 
-        ip_address = yield from find_unused_ip(
-            arp_socket, arp_reply_listener, network)
+        config = network.copy()
+        if not config.address:
+            config.address = yield from find_unused_ip(
+                arp_socket, arp_reply_listener, network)
 
-        return (ip_address, network[1], network[2])
+        return config
     finally:
         arp_reply_listener.stop()
 
 
 def detect_network(
         interface_name: str,
+        local_ip: str,
         event_loop: asyncio.AbstractEventLoop,
-        networks: Iterable[NetworkTuple]) -> asyncio.Future:
+        networks: Iterable[epipynet.netconfig.NetworkConfig]) \
+        -> asyncio.Future:
 
     'Start scanning for gateways on the network'
 
@@ -473,7 +523,7 @@ def detect_network(
     dhcp_socket = get_dhcp_socket(interface_name)
 
     found_network_future = event_loop.create_task(find_network(
-        event_loop, arp_socket, dhcp_socket, networks))
+        event_loop, local_ip, arp_socket, dhcp_socket, networks))
 
     def on_done(
             future: asyncio.Future) -> None:
@@ -509,7 +559,7 @@ def detect_dhcp_server_with_lock(
             dhcp_socket,
             discover,
             epipynet.dhcp.DHCP_TYPE_OFFER,
-            ignore_ip=local_ip_addr)
+            local_ip_addr)
 
         if offer:
             return socket.inet_ntoa(offer.server_addr)

@@ -4,7 +4,7 @@ PY_BINS="\
     bin/epipynet-autoconfigure \
     bin/epipynet-apply-config"
 
-PY_SOURCE="$(find . -name '*.py')"
+PY_SOURCE="$(find lib -name '*.py')"
 
 pep8 $PY_SOURCE
 

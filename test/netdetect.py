@@ -81,7 +81,9 @@ def build_dhcp_offer(
         (epipynet.dhcp.DHCP_OPTION_SERVER,
             socket.inet_aton('192.168.1.3')),
         (epipynet.dhcp.DHCP_OPTION_DNS,
-            socket.inet_aton('192.168.1.4'))]
+            socket.inet_aton('4.3.2.1') +
+            socket.inet_aton('4.3.2.2') +
+            socket.inet_aton('4.3.2.3'))]
 
     return offer
 
@@ -106,7 +108,9 @@ def build_dhcp_ack(
         (epipynet.dhcp.DHCP_OPTION_SERVER,
             socket.inet_aton('192.168.1.3')),
         (epipynet.dhcp.DHCP_OPTION_DNS,
-            socket.inet_aton('192.168.1.4'))]
+            socket.inet_aton('4.3.2.1') +
+            socket.inet_aton('4.3.2.2') +
+            socket.inet_aton('4.3.2.3'))]
 
     return ack
 
@@ -188,6 +192,7 @@ class NetDetectTest(unittest.TestCase):
 
         gateway_addr = socket.inet_ntoa(reply.sender_protocol_addr)
         self.assertEqual(config['gateway'], gateway_addr)
+        self.assertIn(gateway_addr, config['dns_servers'])
 
     def test_dhcp(self) -> None:
 
@@ -213,6 +218,7 @@ class NetDetectTest(unittest.TestCase):
         self.assertEqual(config['host_address'], '192.168.1.100')
         self.assertEqual(config['netmask'], '255.255.255.128')
         self.assertEqual(config['gateway'], '192.168.1.2')
+        self.assertIn('4.3.2.2', config['dns_servers'])
 
 
 if __name__ == '__main__':
