@@ -39,8 +39,8 @@ else:
 #  (ip_address, netmask, gateway)
 NetworkConfigGenerator = \
     Generator[Any, None, epipynet.netconfig.NetworkConfig]
-DhcpPacketGenerator = \
-    Generator[Any, None, epipynet.dhcp.DhcpPacket]
+DhcpReply = Tuple[epipynet.dhcp.DhcpPacket, str]
+DhcpReplyGenerator = Generator[Any, None, DhcpReply]
 
 
 #  This nonsense is because Python 3.4.2 lacks ensure_future,
@@ -56,6 +56,14 @@ class NoAvailableIPAddressException(Exception):
 
     '''Raised when we have found a gateway, but no unused IP addresses
     exist on the subnet'''
+
+    pass
+
+
+class NoDhcpReplyException(Exception):
+
+    '''Raised when there is no response to a DHCP discover or
+    DHCP request packet.'''
 
     pass
 
@@ -229,7 +237,7 @@ def exchange_dhcp(
         dhcp_socket: socket.socket,
         out_packet: epipynet.dhcp.DhcpPacket,
         reply_type: bytes,
-        ignore_ip: bytes) -> DhcpPacketGenerator:
+        ignore_ip: bytes) -> DhcpReplyGenerator:
 
     '''Send a DHCP message and listen for a matching reply.
 
@@ -242,7 +250,7 @@ def exchange_dhcp(
         recv_future = asyncio.Future()  # type: asyncio.Future
 
         def on_recv():
-            recv_bytes = dhcp_socket.recv(4096)
+            (recv_bytes, recv_address) = dhcp_socket.recvfrom(4096)
             try:
                 reply = epipynet.dhcp.decode(recv_bytes)
             except ValueError:
@@ -263,7 +271,9 @@ def exchange_dhcp(
                 return
 
             if not recv_future.done():
-                recv_future.set_result(reply)
+                (remote_ip, remote_port) = recv_address
+                reply_pair = (reply, remote_ip)
+                recv_future.set_result(reply_pair)
 
         event_loop.add_reader(dhcp_socket.fileno(), on_recv)
         try:
@@ -274,7 +284,7 @@ def exchange_dhcp(
         if recv_future.done():
             return recv_future.result()
 
-    return None
+    raise NoDhcpReplyException(out_packet)
 
 
 def build_dhcp_discover(
@@ -356,25 +366,27 @@ def request_dhcp(
         local_ip_addr = None
 
     discover = build_dhcp_discover(mac_address)
-    offer = yield from exchange_dhcp(
-        event_loop,
-        dhcp_socket,
-        discover,
-        epipynet.dhcp.DHCP_TYPE_OFFER,
-        local_ip_addr)
-    if not offer:
+    try:
+        (offer, dhcp_server) = yield from exchange_dhcp(
+            event_loop,
+            dhcp_socket,
+            discover,
+            epipynet.dhcp.DHCP_TYPE_OFFER,
+            local_ip_addr)
+    except NoDhcpReplyException:
         return None
 
     syslog.syslog('Got DHCP offer for ' + socket.inet_ntoa(offer.your_addr))
 
     request = build_dhcp_request(offer, mac_address)
-    ack = yield from exchange_dhcp(
-        event_loop,
-        dhcp_socket,
-        request,
-        epipynet.dhcp.DHCP_TYPE_ACK,
-        local_ip_addr)
-    if not ack:
+    try:
+        (ack, dhcp_server) = yield from exchange_dhcp(
+            event_loop,
+            dhcp_socket,
+            request,
+            epipynet.dhcp.DHCP_TYPE_ACK,
+            local_ip_addr)
+    except NoDhcpReplyException:
         syslog.syslog('No DHCP ack received')
         return None
 
@@ -554,17 +566,17 @@ def detect_dhcp_server_with_lock(
         discover = build_dhcp_discover(mac_address)
 
         local_ip_addr = socket.inet_aton(local_ip)
-        offer = yield from exchange_dhcp(
-            event_loop,
-            dhcp_socket,
-            discover,
-            epipynet.dhcp.DHCP_TYPE_OFFER,
-            local_ip_addr)
-
-        if offer:
-            return socket.inet_ntoa(offer.server_addr)
-        else:
+        try:
+            (offer, dhcp_server) = yield from exchange_dhcp(
+                event_loop,
+                dhcp_socket,
+                discover,
+                epipynet.dhcp.DHCP_TYPE_OFFER,
+                local_ip_addr)
+        except NoDhcpReplyException:
             return None
+
+        return dhcp_server
 
 
 detect_dhcp_lock = asyncio.Lock()

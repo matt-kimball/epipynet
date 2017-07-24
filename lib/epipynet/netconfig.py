@@ -1,5 +1,7 @@
 import json
 
+from typing import *
+
 
 class NetworkConfig(object):
 
